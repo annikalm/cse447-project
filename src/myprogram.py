@@ -1,97 +1,162 @@
 #!/usr/bin/env python
+import argparse
+import json
 import os
-import string
 import random
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+import string
+from pathlib import Path
+
+import torch
+
+from data import Vocab, build_vocab, load_lines, make_training_batches
+from inference import predict_batch, predict_file
+from model import CharGRU
+from train_utils import save_checkpoint, train_model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest='mode', required=True)
+
+    train_p = subparsers.add_parser('train', help='train model')
+    train_p.add_argument('--work_dir', default='work', help='where to save artifacts')
+    train_p.add_argument('--train_data', default='example/input.txt', help='training text file')
+    train_p.add_argument('--vocab_size', type=int, default=2000, help='max characters in vocab')
+    train_p.add_argument('--seq_len', type=int, default=64, help='sequence length')
+    train_p.add_argument('--batch_size', type=int, default=64, help='batch size')
+    train_p.add_argument('--epochs', type=int, default=3, help='training epochs')
+    train_p.add_argument('--emb_dim', type=int, default=64, help='embedding size')
+    train_p.add_argument('--hidden_dim', type=int, default=128, help='hidden size')
+    train_p.add_argument('--lr', type=float, default=1e-3, help='learning rate')
+
+    test_p = subparsers.add_parser('test', help='run inference')
+    test_p.add_argument('--work_dir', default='work', help='where artifacts live')
+    test_p.add_argument('--test_data', default='example/input.txt', help='test input file')
+    test_p.add_argument('--test_output', default='pred.txt', help='where to write predictions')
+    test_p.add_argument('--batch_size', type=int, default=64, help='batch size for inference')
+
+    return parser.parse_args()
+
+
+def set_seed(seed: int = 0):
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def ensure_dir(path: str):
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
 class MyModel:
     """
-    This is a starter model to get you started. Feel free to modify this file.
+    char level GRU model, returns random chars if training is missing
     """
 
+    def __init__(self, model=None, vocab: Vocab | None = None, config: dict | None = None, device=None):
+        self.model = model
+        self.vocab = vocab
+        self.config = config or {}
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     @classmethod
-    def load_training_data(cls):
-        # your code here
-        # this particular model doesn't train
-        return []
+    def load_training_data(cls, fname):
+        return load_lines(fname)
 
     @classmethod
     def load_test_data(cls, fname):
-        # your code here
-        data = []
-        with open(fname) as f:
-            for line in f:
-                inp = line[:-1]  # the last character is a newline
-                data.append(inp)
-        return data
+        return load_lines(fname)
 
     @classmethod
     def write_pred(cls, preds, fname):
-        with open(fname, 'wt') as f:
+        with open(fname, 'wt', encoding='utf-8') as f:
             for p in preds:
-                f.write('{}\n'.format(p))
+                f.write(f'{p}\n')
 
-    def run_train(self, data, work_dir):
-        # your code here
-        pass
+    def run_train(self, lines, work_dir, args):
+        vocab = build_vocab(lines, max_size=args.vocab_size)
+        train_batches = make_training_batches(lines, vocab, seq_len=args.seq_len, batch_size=args.batch_size)
 
-    def run_pred(self, data):
-        # your code here
-        preds = []
-        all_chars = string.ascii_letters
-        for inp in data:
-            # this model just predicts a random character each time
-            top_guesses = [random.choice(all_chars) for _ in range(3)]
-            preds.append(''.join(top_guesses))
-        return preds
+        model = CharGRU(len(vocab), emb_dim=args.emb_dim, hidden_dim=args.hidden_dim).to(self.device)
+
+        config = {
+            'vocab_size': len(vocab),
+            'emb_dim': args.emb_dim,
+            'hidden_dim': args.hidden_dim,
+            'seq_len': args.seq_len,
+            'batch_size': args.batch_size,
+        }
+
+        train_model(model, train_batches, device=self.device, epochs=args.epochs, lr=args.lr)
+        self.model = model
+        self.vocab = vocab
+        self.config = config
+        self.save(work_dir)
+
+    def run_pred(self, data_lines, batch_size: int = 64):
+        # if nothing trained yet then js return random things
+        if self.model is None or self.vocab is None:
+            chars = string.ascii_letters or 'abc'
+            return [''.join(random.choice(chars) for _ in range(3)) for _ in data_lines]
+
+        self.model.eval()
+        return predict_batch(self.model, self.vocab, data_lines, device=self.device, k=3)
 
     def save(self, work_dir):
-        # your code here
-        # this particular model has nothing to save, but for demonstration purposes we will save a blank file
-        with open(os.path.join(work_dir, 'model.checkpoint'), 'wt') as f:
-            f.write('dummy save')
+        if self.model is not None and self.vocab is not None:
+            save_checkpoint(work_dir, self.model, self.vocab, self.config)
+        else:
+            # make sure right dir
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def load(cls, work_dir):
-        # your code here
-        # this particular model has nothing to load, but for demonstration purposes we will load a blank file
-        with open(os.path.join(work_dir, 'model.checkpoint')) as f:
-            dummy_save = f.read()
-        return MyModel()
+        artifacts_path = Path(work_dir)
+        model_path = artifacts_path / 'model.pt'
+        vocab_path = artifacts_path / 'vocab.json'
+        config_path = artifacts_path / 'config.json'
+
+        if not (model_path.exists() and vocab_path.exists() and config_path.exists()):
+            return cls(model=None, vocab=None, config=None)
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        vocab = Vocab.load(vocab_path)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = CharGRU(len(vocab), emb_dim=config.get('emb_dim', 64), hidden_dim=config.get('hidden_dim', 128))
+        state = torch.load(model_path, map_location=device)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        return cls(model=model, vocab=vocab, config=config, device=device)
 
 
-if __name__ == '__main__':
-    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('mode', choices=('train', 'test'), help='what to run')
-    parser.add_argument('--work_dir', help='where to save', default='work')
-    parser.add_argument('--test_data', help='path to test data', default='example/input.txt')
-    parser.add_argument('--test_output', help='path to write test predictions', default='pred.txt')
-    args = parser.parse_args()
-
-    random.seed(0)
-
+def main():
+    args = parse_args()
+    set_seed(0)
     if args.mode == 'train':
         if not os.path.isdir(args.work_dir):
-            print('Making working directory {}'.format(args.work_dir))
-            os.makedirs(args.work_dir)
-        print('Instatiating model')
+            print(f'Making working directory {args.work_dir}')
+            os.makedirs(args.work_dir, exist_ok=True)
+        print('Instantiating model')
         model = MyModel()
         print('Loading training data')
-        train_data = MyModel.load_training_data()
+        train_data = MyModel.load_training_data(args.train_data)
         print('Training')
-        model.run_train(train_data, args.work_dir)
+        model.run_train(train_data, args.work_dir, args)
         print('Saving model')
         model.save(args.work_dir)
     elif args.mode == 'test':
         print('Loading model')
         model = MyModel.load(args.work_dir)
-        print('Loading test data from {}'.format(args.test_data))
+        print(f'Loading test data from {args.test_data}')
         test_data = MyModel.load_test_data(args.test_data)
         print('Making predictions')
-        pred = model.run_pred(test_data)
-        print('Writing predictions to {}'.format(args.test_output))
-        assert len(pred) == len(test_data), 'Expected {} predictions but got {}'.format(len(test_data), len(pred))
-        model.write_pred(pred, args.test_output)
-    else:
-        raise NotImplementedError('Unknown mode {}'.format(args.mode))
+        pred = model.run_pred(test_data, batch_size=args.batch_size)
+        print(f'Writing predictions to {args.test_output}')
+        assert len(pred) == len(test_data), f'Expected {len(test_data)} predictions but got {len(pred)}'
+        MyModel.write_pred(pred, args.test_output)
+
+
+if __name__ == '__main__':
+    main()
