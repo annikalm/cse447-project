@@ -23,17 +23,17 @@ def parse_args():
     train_p.add_argument('--train_data', default='example/input.txt', help='training text file')
     train_p.add_argument('--vocab_size', type=int, default=2000, help='max characters in vocab')
     train_p.add_argument('--seq_len', type=int, default=64, help='sequence length')
-    train_p.add_argument('--batch_size', type=int, default=64, help='batch size')
-    train_p.add_argument('--epochs', type=int, default=3, help='training epochs')
-    train_p.add_argument('--emb_dim', type=int, default=64, help='embedding size')
-    train_p.add_argument('--hidden_dim', type=int, default=128, help='hidden size')
+    train_p.add_argument('--batch_size', type=int, default=128, help='batch size')
+    train_p.add_argument('--epochs', type=int, default=20, help='training epochs')
+    train_p.add_argument('--emb_dim', type=int, default=256, help='embedding size')
+    train_p.add_argument('--hidden_dim', type=int, default=512, help='hidden size')
     train_p.add_argument('--lr', type=float, default=1e-3, help='learning rate')
 
     test_p = subparsers.add_parser('test', help='run inference')
     test_p.add_argument('--work_dir', default='work', help='where artifacts live')
     test_p.add_argument('--test_data', default='example/input.txt', help='test input file')
     test_p.add_argument('--test_output', default='pred.txt', help='where to write predictions')
-    test_p.add_argument('--batch_size', type=int, default=64, help='batch size for inference')
+    test_p.add_argument('--batch_size', type=int, default=4096, help='batch size for inference')
 
     return parser.parse_args()
 
@@ -99,7 +99,9 @@ class MyModel:
             return [''.join(random.choice(chars) for _ in range(3)) for _ in data_lines]
 
         self.model.eval()
-        return predict_batch(self.model, self.vocab, data_lines, device=self.device, k=3)
+        # disable gradient engine for maximum speed and memory efficiency
+        with torch.inference_mode():
+            return predict_batch(self.model, self.vocab, data_lines, device=self.device, k=3)
 
     def save(self, work_dir):
         if self.model is not None and self.vocab is not None:
@@ -123,7 +125,7 @@ class MyModel:
 
         vocab = Vocab.load(vocab_path)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = CharGRU(len(vocab), emb_dim=config.get('emb_dim', 64), hidden_dim=config.get('hidden_dim', 128))
+        model = CharGRU(len(vocab), emb_dim=config.get('emb_dim', 128), hidden_dim=config.get('hidden_dim', 256))
         state = torch.load(model_path, map_location=device)
         model.load_state_dict(state)
         model.to(device)
